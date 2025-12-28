@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use eyre::{Context, Result};
 use log::{info, warn};
+use palette::FromColor;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
@@ -224,19 +225,12 @@ impl LayerShellHandler for App {
                 let x = (index % width as usize) as u32;
                 let y = (index / width as usize) as u32;
 
-                let xf = x as f32 / width as f32;
-                let yf = y as f32 / height as f32;
-
-                let srgb = oklab::oklab_to_srgb(oklab::Oklab {
-                    l: 0.7,
-                    a: xf * 0.8 - 0.4,
-                    b: yf * 0.8 - 0.4,
-                });
+                let srgb = color_for_pixel(x, y, width, height);
 
                 let a = 0xFF;
-                let r = srgb.r as u32;
-                let g = srgb.g as u32;
-                let b = srgb.b as u32;
+                let r = srgb.red as u32;
+                let g = srgb.green as u32;
+                let b = srgb.blue as u32;
                 let color = (a << 24) + (r << 16) + (g << 8) + b;
 
                 let array: &mut [u8; 4] = chunk.try_into().unwrap();
@@ -258,6 +252,18 @@ impl LayerShellHandler for App {
 
         buffer.destroy();
     }
+}
+
+fn color_for_pixel(x: u32, y: u32, width: u32, height: u32) -> palette::Srgb<u8> {
+    let xf = x as f32 / width as f32;
+    let yf = y as f32 / height as f32;
+
+    palette::Srgb::from_color(palette::Oklab {
+        l: 0.7,
+        a: xf * 0.8 - 0.4,
+        b: yf * 0.8 - 0.4,
+    })
+    .into_format::<u8>()
 }
 
 impl ShmHandler for App {

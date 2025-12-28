@@ -7,6 +7,9 @@ edition = "2024"
 env_logger = "0.11.8"
 eyre = "0.6.12"
 log = "0.4.29"
-oklab = "1.1.2"
+palette = "0.7.6"
 smithay-client-toolkit = "0.20.0"
 wayland-client = "0.31.11"
+
+[profile.dev]
+opt-level = 1
