@@ -1,14 +1,24 @@
-use std::time::Duration;
+mod desktop;
 
-use eyre::{Context, Result};
-use log::{info, warn};
-use palette::FromColor;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+use eyre::{Context, Result, bail};
+use freedesktop_file_parser::{DesktopFile, EntryType};
+use log::{error, info, warn};
+use palette::{FromColor, IntoColor, Oklab, color_difference::EuclideanDistance};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
     reexports::{calloop::EventLoop, calloop_wayland_source::WaylandSource},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        SeatHandler, SeatState,
+        pointer::{BTN_LEFT, PointerEventKind, PointerHandler},
+    },
     shell::{
         WaylandSurface,
         wlr_layer::{
@@ -20,13 +30,22 @@ use smithay_client_toolkit::{
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_buffer, wl_output::WlOutput, wl_shm},
+    protocol::{wl_buffer, wl_output::WlOutput, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm},
 };
 
 fn main() -> Result<()> {
     env_logger::builder()
         .filter(None, log::LevelFilter::Info)
         .init();
+
+    let now = Instant::now();
+    let desktop_files = desktop::find_desktop_files().wrap_err("loading .desktop files")?;
+    info!(
+        "Loaded {} desktop icons in {:?}",
+        desktop_files.len(),
+        now.elapsed()
+    );
+
     let conn = Connection::connect_to_env().wrap_err("can't connect to Wayland socket")?;
 
     let (globals, event_queue) = registry_queue_init(&conn).wrap_err("initializing connection")?;
@@ -42,7 +61,10 @@ fn main() -> Result<()> {
         layer_shell: LayerShell::bind(&globals, qh)
             .wrap_err("failed to bind zwlr_layer_shell_v1 global, does the compositor not support layer shell?")?,
         shm: Shm::bind(&globals, qh).wrap_err("failed to bind shm")?,
+        seat_state: SeatState::new(&globals, qh),
 
+        desktop_files,
+        pointers: HashMap::new(),
         layer_surfaces: Vec::new(),
     };
 
@@ -63,13 +85,18 @@ struct App {
     compositor_state: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
+    seat_state: SeatState,
 
+    desktop_files: Vec<(DesktopFile, Oklab)>,
+    pointers: HashMap<WlSeat, WlPointer>,
     layer_surfaces: Vec<OutputSurface>,
 }
 
 struct OutputSurface {
     output: WlOutput,
-    _layer_surface: LayerSurface,
+    layer_surface: LayerSurface,
+    width: u32,
+    height: u32,
 }
 
 impl ProvidesRegistryState for App {
@@ -108,12 +135,15 @@ impl OutputHandler for App {
             Some("wallpaper"),
             Some(&output),
         );
+        layer_surface.set_exclusive_zone(-1);
         layer_surface.set_anchor(Anchor::all());
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer_surface.wl_surface().commit();
         self.layer_surfaces.push(OutputSurface {
             output,
-            _layer_surface: layer_surface,
+            layer_surface,
+            width: 0,
+            height: 0,
         });
     }
 
@@ -216,6 +246,16 @@ impl LayerShellHandler for App {
     ) {
         let (width, height) = configure.new_size;
         info!("Reconfiguring surface to {}x{}", width, height);
+
+        if let Some(surface) = self
+            .layer_surfaces
+            .iter_mut()
+            .find(|surface| surface.layer_surface == *layer)
+        {
+            surface.width = width;
+            surface.height = height;
+        }
+
         let mut pool = RawPool::new(width as usize * height as usize * 4, &self.shm).unwrap();
         let canvas = pool.mmap();
         canvas
@@ -272,9 +312,138 @@ impl ShmHandler for App {
     }
 }
 
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wayland_client::protocol::wl_seat::WlSeat,
+    ) {
+    }
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wayland_client::protocol::wl_seat::WlSeat,
+        capability: smithay_client_toolkit::seat::Capability,
+    ) {
+        if capability == smithay_client_toolkit::seat::Capability::Pointer {
+            self.pointers.insert(
+                seat.clone(),
+                self.seat_state.get_pointer(qh, &seat).unwrap(),
+            );
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        seat: wayland_client::protocol::wl_seat::WlSeat,
+        capability: smithay_client_toolkit::seat::Capability,
+    ) {
+        if capability == smithay_client_toolkit::seat::Capability::Pointer {
+            self.pointers.remove(&seat);
+        }
+    }
+
+    fn remove_seat(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wayland_client::protocol::wl_seat::WlSeat,
+    ) {
+    }
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wayland_client::protocol::wl_pointer::WlPointer,
+        events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
+    ) {
+        for event in events {
+            match event.kind {
+                PointerEventKind::Release {
+                    button: BTN_LEFT, ..
+                } => {
+                    let Some(surface) = self
+                        .layer_surfaces
+                        .iter()
+                        .find(|surface| *surface.layer_surface.wl_surface() == event.surface)
+                    else {
+                        return;
+                    };
+
+                    let srgb = color_for_pixel(
+                        event.position.0 as u32,
+                        event.position.1 as u32,
+                        surface.width,
+                        surface.height,
+                    );
+
+                    let oklab: Oklab = srgb.into_format::<f32>().into_color();
+
+                    let best_match = self.desktop_files.iter().min_by_key(|(_, icon_color)| {
+                        (oklab.distance(*icon_color) * 1000000.0) as u32
+                    });
+
+                    if let Some(best_match) = best_match
+                        && let EntryType::Application(app) = &best_match.0.entry.entry_type
+                        && let Some(exec) = &app.exec
+                    {
+                        // lol terrible implementation that works well enough
+                        // https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
+                        let exec = exec.replace("%U", "").replace("%F", "");
+                        if exec.contains("%") {
+                            warn!(
+                                "Trying to execute insuffiently substituded command-line, refusing: {}",
+                                exec
+                            );
+                            return;
+                        }
+                        if let Err(err) = spawn(&exec) {
+                            error!("Failed to spawn program: {}: {:?}", exec, err);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn spawn(cmd: &str) -> Result<()> {
+    info!("Spawning program: {cmd}");
+    let output = std::process::Command::new("niri")
+        .arg("msg")
+        .arg("action")
+        .arg("spawn-sh")
+        .arg("--")
+        .arg(cmd)
+        .output()
+        .wrap_err("executing niri msg action spawn-sh")?;
+    if !output.status.success() {
+        bail!(
+            "niri returned error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 smithay_client_toolkit::delegate_registry!(App);
 smithay_client_toolkit::delegate_output!(App);
 smithay_client_toolkit::delegate_compositor!(App);
 smithay_client_toolkit::delegate_layer!(App);
 smithay_client_toolkit::delegate_shm!(App);
 wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
+smithay_client_toolkit::delegate_seat!(App);
+smithay_client_toolkit::delegate_pointer!(App);

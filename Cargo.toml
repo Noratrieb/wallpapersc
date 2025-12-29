@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 env_logger = "0.11.8"
 eyre = "0.6.12"
+freedesktop-file-parser = "0.3.1"
+freedesktop-icons = "0.4.0"
+image = "0.25.9"
 log = "0.4.29"
 palette = "0.7.6"
 smithay-client-toolkit = "0.20.0"
@@ -13,3 +16,6 @@ wayland-client = "0.31.11"
 
 [profile.dev]
 opt-level = 1
+
+[profile.release]
+debug = "line-tables-only"
