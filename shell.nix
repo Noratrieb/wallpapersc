@@ -3,6 +3,7 @@
   buildInputs = with pkgs; [
     wayland
     libxkbcommon
+    vulkan-loader
   ];
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
 }

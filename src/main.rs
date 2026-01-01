@@ -2,13 +2,17 @@ mod desktop;
 
 use std::{
     collections::HashMap,
+    ptr::NonNull,
     time::{Duration, Instant},
 };
 
-use eyre::{Context, Result, bail};
+use eyre::{Context, Result, bail, eyre};
 use freedesktop_file_parser::EntryType;
 use log::{error, info, warn};
 use palette::{FromColor, IntoColor, Oklab};
+use raw_window_handle::{
+    RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
@@ -25,13 +29,17 @@ use smithay_client_toolkit::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
         },
     },
-    shm::{Shm, ShmHandler, raw::RawPool},
+    shm::{Shm, ShmHandler},
 };
 use wayland_client::{
-    Connection, QueueHandle,
+    Connection, Proxy, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_buffer, wl_output::WlOutput, wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm},
+    protocol::{
+        wl_buffer, wl_output::WlOutput, wl_pointer::WlPointer, wl_seat::WlSeat,
+        wl_surface::WlSurface,
+    },
 };
+use wgpu::util::DeviceExt;
 
 use crate::desktop::DesktopEntries;
 
@@ -55,7 +63,84 @@ fn main() -> Result<()> {
     let mut event_loop: EventLoop<App> = EventLoop::try_new().wrap_err("creating event loop")?;
     let qh: &QueueHandle<App> = &event_queue.handle();
 
+    let wgpu_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+
+    let wgpu_adapter =
+        pollster::block_on(wgpu_instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .wrap_err("failed to request adapter")?;
+
+    let (wgpu_device, wgpu_queue) =
+        pollster::block_on(wgpu_adapter.request_device(&Default::default()))
+            .wrap_err("failed to request device")?;
+
+    let shader = wgpu_device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+    let wgpu_screen_size_bind_group_layout =
+        wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let render_pipeline_layout =
+        wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[&wgpu_screen_size_bind_group_layout],
+            immediate_size: 0,
+        });
+
+    let wgpu_render_pipeline =
+        wgpu_device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"), // 1.
+                buffers: &[],                 // 2.
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                // 3.
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    // 4.
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw, // 2.
+                cull_mode: Some(wgpu::Face::Back),
+                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
+                polygon_mode: wgpu::PolygonMode::Fill,
+                // Requires Features::DEPTH_CLIP_CONTROL
+                unclipped_depth: false,
+                // Requires Features::CONSERVATIVE_RASTERIZATION
+                conservative: false,
+            },
+            depth_stencil: None, // 1.
+            multisample: wgpu::MultisampleState {
+                count: 1,                         // 2.
+                mask: !0,                         // 3.
+                alpha_to_coverage_enabled: false, // 4.
+            },
+            multiview_mask: None, // 5.
+            cache: None,          // 6.
+        });
+
     let mut app = App {
+        conn: conn.clone(),
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, qh),
         compositor_state: CompositorState::bind(&globals, qh)
@@ -68,10 +153,18 @@ fn main() -> Result<()> {
         desktop_files,
         pointers: HashMap::new(),
         layer_surfaces: Vec::new(),
+
+        wgpu_instance,
+        wgpu_adapter,
+        wgpu_device,
+        wgpu_queue,
+        wgpu_render_pipeline,
+        wgpu_screen_size_bind_group_layout
     };
 
     WaylandSource::new(conn.clone(), event_queue)
         .insert(event_loop.handle())
+        .map_err(|err| eyre!("{:?}", err))
         .wrap_err("failed to register wayland event source")?;
 
     let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
@@ -84,6 +177,7 @@ fn main() -> Result<()> {
 }
 
 struct App {
+    conn: Connection,
     registry_state: RegistryState,
     output_state: OutputState,
     compositor_state: CompositorState,
@@ -94,13 +188,30 @@ struct App {
     desktop_files: DesktopEntries,
     pointers: HashMap<WlSeat, WlPointer>,
     layer_surfaces: Vec<OutputSurface>,
+
+    wgpu_instance: wgpu::Instance,
+    wgpu_adapter: wgpu::Adapter,
+    wgpu_device: wgpu::Device,
+    wgpu_queue: wgpu::Queue,
+    wgpu_render_pipeline: wgpu::RenderPipeline,
+    wgpu_screen_size_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 struct OutputSurface {
+    // must be first to be dropped before the Wayland surface
+    wgpu_surface: wgpu::Surface<'static>,
     output: WlOutput,
     layer_surface: LayerSurface,
     width: u32,
     height: u32,
+    wgpu_screen_size_buffer: wgpu::Buffer,
+    wgpu_screen_size_bind_group: wgpu::BindGroup,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ScreenSizeUniform {
+    size: [f32; 2], // width, height
 }
 
 impl ProvidesRegistryState for App {
@@ -134,7 +245,7 @@ impl OutputHandler for App {
             self.compositor_state.create_surface(qh);
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
-            surface,
+            surface.clone(),
             Layer::Background,
             Some("wallpaper"),
             Some(&output),
@@ -143,12 +254,47 @@ impl OutputHandler for App {
         layer_surface.set_anchor(Anchor::all());
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer_surface.wl_surface().commit();
-        self.layer_surfaces.push(OutputSurface {
-            output,
-            layer_surface,
-            width: 0,
-            height: 0,
-        });
+
+        let wgpu_screen_size_buffer =
+            self.wgpu_device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Screen Size Uniform Buffer"),
+                    contents: bytemuck::bytes_of(&ScreenSizeUniform { size: [0.0, 0.0] }),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+
+        let wgpu_screen_size_bind_group =
+            self.wgpu_device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &self.wgpu_screen_size_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &wgpu_screen_size_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    }],
+                    label: Some("screen_size_bind_group"),
+                });
+
+        match setup_wgpu_surface(self, &surface) {
+            Ok(wgu_surface) => {
+                self.layer_surfaces.push(OutputSurface {
+                    wgpu_surface: wgu_surface,
+                    output,
+                    layer_surface,
+                    width: 0,
+                    height: 0,
+                    wgpu_screen_size_buffer,
+                    wgpu_screen_size_bind_group,
+                });
+            }
+            Err(err) => error!(
+                "Failed to create wgpu surface, log at prior logs for more detail {:?}",
+                eyre!(err)
+            ),
+        }
     }
 
     fn update_output(
@@ -182,6 +328,23 @@ impl OutputHandler for App {
             self.layer_surfaces.swap_remove(suface_idx);
         }
     }
+}
+
+fn setup_wgpu_surface(app: &App, surface: &WlSurface) -> Result<wgpu::Surface<'static>> {
+    let wgu_surface = unsafe {
+        app.wgpu_instance
+            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+                    NonNull::new(app.conn.backend().display_ptr().cast()).unwrap(),
+                )),
+                raw_window_handle: RawWindowHandle::Wayland(WaylandWindowHandle::new(
+                    NonNull::new(surface.id().as_ptr().cast()).unwrap(),
+                )),
+            })
+    }
+    .wrap_err("failed to create wgpu surface")?;
+
+    Ok(wgu_surface)
 }
 
 impl CompositorHandler for App {
@@ -250,7 +413,7 @@ impl LayerShellHandler for App {
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         layer: &smithay_client_toolkit::shell::wlr_layer::LayerSurface,
         configure: smithay_client_toolkit::shell::wlr_layer::LayerSurfaceConfigure,
         _serial: u32,
@@ -258,53 +421,86 @@ impl LayerShellHandler for App {
         let (width, height) = configure.new_size;
         info!("Reconfiguring surface to {}x{}", width, height);
 
-        if let Some(surface) = self
+        let Some(surface) = self
             .layer_surfaces
             .iter_mut()
             .find(|surface| surface.layer_surface == *layer)
-        {
-            surface.width = width;
-            surface.height = height;
-        }
+        else {
+            return;
+        };
 
-        let mut pool = RawPool::new(width as usize * height as usize * 4, &self.shm).unwrap();
-        let canvas = pool.mmap();
-        canvas
-            .chunks_exact_mut(4)
-            .enumerate()
-            .for_each(|(index, chunk)| {
-                let x = (index % width as usize) as u32;
-                let y = (index / width as usize) as u32;
+        surface.width = width;
+        surface.height = height;
 
-                let srgb = color_for_pixel(x, y, width, height);
-
-                let a = 0xFF;
-                let r = srgb.red as u32;
-                let g = srgb.green as u32;
-                let b = srgb.blue as u32;
-                let color = (a << 24) + (r << 16) + (g << 8) + b;
-
-                let array: &mut [u8; 4] = chunk.try_into().unwrap();
-                *array = color.to_le_bytes();
-            });
-
-        let buffer = pool.create_buffer(
+        self.wgpu_queue.write_buffer(
+            &surface.wgpu_screen_size_buffer,
             0,
-            width as i32,
-            height as i32,
-            width as i32 * 4,
-            wl_shm::Format::Argb8888,
-            (),
-            qh,
+            bytemuck::bytes_of(&ScreenSizeUniform {
+                size: [width as f32, height as f32],
+            }),
         );
 
-        layer.wl_surface().attach(Some(&buffer), 0, 0);
-        layer.wl_surface().commit();
+        let cap = surface.wgpu_surface.get_capabilities(&self.wgpu_adapter);
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: cap.formats[0],
+            view_formats: vec![cap.formats[0]],
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            width,
+            height,
+            desired_maximum_frame_latency: 2,
+            // Wayland is inherently a mailbox system.
+            present_mode: wgpu::PresentMode::Mailbox,
+        };
+        surface
+            .wgpu_surface
+            .configure(&self.wgpu_device, &surface_config);
 
-        buffer.destroy();
+        let surface_texture = surface
+            .wgpu_surface
+            .get_current_texture()
+            .expect("failed to acquire next swapchain texture");
+        let texture_view: wgpu::TextureView = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.wgpu_device.create_command_encoder(&Default::default());
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[
+                    // This is what @location(0) in the fragment shader targets
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &texture_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.1,
+                                g: 0.5,
+                                b: 0.3,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    }),
+                ],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+
+            // NEW!
+            render_pass.set_pipeline(&self.wgpu_render_pipeline); // 2.
+            render_pass.set_bind_group(0, Some(&surface.wgpu_screen_size_bind_group), &[]);
+            render_pass.draw(0..6, 0..1); // 3.
+        }
+
+        self.wgpu_queue.submit(Some(encoder.finish()));
+        surface_texture.present();
     }
 }
 
+// keep it in sync with the gpu implementation
 fn color_for_pixel(x: u32, y: u32, width: u32, height: u32) -> palette::Srgb<u8> {
     let xf = x as f32 / width as f32;
     let yf = y as f32 / height as f32;
