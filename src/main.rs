@@ -9,7 +9,7 @@ use std::{
 use eyre::{Context, Result, bail, eyre};
 use freedesktop_file_parser::EntryType;
 use log::{error, info, warn};
-use palette::{FromColor, IntoColor, Oklab};
+use palette::Oklab;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
@@ -18,7 +18,7 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         SeatHandler, SeatState,
-        pointer::{BTN_LEFT, PointerEventKind, PointerHandler},
+        pointer::{BTN_LEFT, BTN_RIGHT, PointerEventKind, PointerHandler},
     },
     shell::{
         WaylandSurface,
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
         shm: Shm::bind(&globals, qh).wrap_err("failed to bind shm")?,
         seat_state: SeatState::new(&globals, qh),
 
-        gpu: AppGpuState::new()?,
+        gpu: AppGpuState::new(desktop_files.colors())?,
 
         desktop_files,
         pointers: HashMap::new(),
@@ -114,6 +114,7 @@ struct OutputSurface {
     layer_surface: LayerSurface,
     width: u32,
     height: u32,
+    voronoi_progress: f32,
 }
 
 impl ProvidesRegistryState for App {
@@ -165,6 +166,7 @@ impl OutputHandler for App {
                     layer_surface,
                     width: 0,
                     height: 0,
+                    voronoi_progress: 0.0,
                 });
             }
             Err(err) => error!(
@@ -233,6 +235,7 @@ impl CompositorHandler for App {
         _surface: &wayland_client::protocol::wl_surface::WlSurface,
         _time: u32,
     ) {
+        dbg!("yeet");
     }
 
     fn surface_enter(
@@ -293,20 +296,20 @@ impl LayerShellHandler for App {
         surface.height = height;
 
         surface.gpu.resize(&self.gpu, width, height);
+        surface.gpu.draw(&self.gpu);
     }
 }
 
 // keep it in sync with the gpu implementation
-fn color_for_pixel(x: u32, y: u32, width: u32, height: u32) -> palette::Srgb<u8> {
+fn color_for_pixel(x: u32, y: u32, width: u32, height: u32) -> Oklab {
     let xf = x as f32 / width as f32;
     let yf = y as f32 / height as f32;
 
-    palette::Srgb::from_color(palette::Oklab {
+    palette::Oklab {
         l: 0.7,
         a: xf * 0.8 - 0.4,
-        b: yf * 0.8 - 0.4,
-    })
-    .into_format::<u8>()
+        b: yf * 0.7 - 0.4,
+    }
 }
 
 impl ShmHandler for App {
@@ -373,47 +376,68 @@ impl PointerHandler for App {
         events: &[smithay_client_toolkit::seat::pointer::PointerEvent],
     ) {
         for event in events {
-            if let PointerEventKind::Release {
-                button: BTN_LEFT, ..
-            } = event.kind
-            {
-                let Some(surface) = self
-                    .layer_surfaces
-                    .iter()
-                    .find(|surface| *surface.layer_surface.wl_surface() == event.surface)
-                else {
-                    return;
-                };
+            let Some(surface) = self
+                .layer_surfaces
+                .iter_mut()
+                .find(|surface| *surface.layer_surface.wl_surface() == event.surface)
+            else {
+                return;
+            };
 
-                let srgb = color_for_pixel(
-                    event.position.0 as u32,
-                    event.position.1 as u32,
-                    surface.width,
-                    surface.height,
-                );
+            match event.kind {
+                PointerEventKind::Release {
+                    button: BTN_LEFT, ..
+                } => {
+                    let oklab = color_for_pixel(
+                        event.position.0 as u32,
+                        event.position.1 as u32,
+                        surface.width,
+                        surface.height,
+                    );
 
-                let oklab: Oklab = srgb.into_format::<f32>().into_color();
+                    let best_match = self.desktop_files.find_entry(oklab);
 
-                let best_match = self.desktop_files.find_entry(oklab);
-
-                if let Some(best_match) = best_match
-                    && let EntryType::Application(app) = &best_match.file.entry.entry_type
-                    && let Some(exec) = &app.exec
-                {
-                    // lol terrible implementation that works well enough
-                    // https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
-                    let exec = exec.replace("%U", "").replace("%F", "");
-                    if exec.contains("%") {
-                        warn!(
-                            "Trying to execute insuffiently substituded command-line, refusing: {}",
-                            exec
-                        );
-                        return;
-                    }
-                    if let Err(err) = spawn(&exec) {
-                        error!("Failed to spawn program: {}: {:?}", exec, err);
+                    if let Some(best_match) = best_match
+                        && let EntryType::Application(app) = &best_match.file.entry.entry_type
+                        && let Some(exec) = &app.exec
+                    {
+                        // lol terrible implementation that works well enough
+                        // https://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
+                        let exec = exec.replace("%U", "").replace("%F", "");
+                        if exec.contains("%") {
+                            warn!(
+                                "Trying to execute insuffiently substituded command-line, refusing: {}",
+                                exec
+                            );
+                            return;
+                        }
+                        if let Err(err) = spawn(&exec) {
+                            error!("Failed to spawn program: {}: {:?}", exec, err);
+                        }
                     }
                 }
+                PointerEventKind::Press {
+                    button: BTN_RIGHT, ..
+                } => {
+                    surface.voronoi_progress = 1.0;
+
+                    surface
+                        .gpu
+                        .set_voronoi_progress(&self.gpu, surface.voronoi_progress);
+                    surface.gpu.draw(&self.gpu);
+                }
+                PointerEventKind::Release {
+                    button: BTN_RIGHT, ..
+                }
+                | PointerEventKind::Leave { .. } => {
+                    surface.voronoi_progress = 0.0;
+
+                    surface
+                        .gpu
+                        .set_voronoi_progress(&self.gpu, surface.voronoi_progress);
+                    surface.gpu.draw(&self.gpu);
+                }
+                _ => (),
             }
         }
     }

@@ -17,16 +17,17 @@ impl DesktopEntries {
     pub fn count(&self) -> usize {
         self.entries.len()
     }
+    pub fn colors(&self) -> impl Iterator<Item = Oklab> + ExactSizeIterator {
+        self.entries.iter().map(|entry| entry.avg_icon_color)
+    }
     pub fn find_entry(&self, color: Oklab) -> Option<&DesktopEntry> {
-        self.entries.iter().min_by(|x, y| {
-            f32::total_cmp(
-                &diff_color(x.avg_icon_color, color),
-                &diff_color(y.avg_icon_color, color),
-            )
-        })
+        self.entries
+            .iter()
+            .min_by_key(|x| OrdFloat(diff_color(x.avg_icon_color, color)))
     }
 }
 
+// keep it in sync with the gpu implementation
 fn diff_color(icon: Oklab, color: Oklab) -> f32 {
     icon.distance_squared(color)
 }
@@ -98,9 +99,14 @@ pub(crate) fn find_desktop_files() -> Result<DesktopEntries> {
         .wrap_err_with(|| format!("{}", base.display()))?;
     }
 
-    Ok(DesktopEntries {
-        entries: results.into_values().collect(),
-    })
+    let mut entries = results.into_values().collect::<Vec<_>>();
+
+    entries.sort_by_key(|entry| {
+        let (l, a, b) = entry.avg_icon_color.into_components();
+        (OrdFloat(a), OrdFloat(b), OrdFloat(l))
+    });
+
+    Ok(DesktopEntries { entries })
 }
 
 fn average_color(image: &image::DynamicImage) -> palette::Oklab {
@@ -129,5 +135,24 @@ fn average_color(image: &image::DynamicImage) -> palette::Oklab {
         l: total_l / count,
         a: total_a / count,
         b: total_b / count,
+    }
+}
+
+struct OrdFloat(f32);
+
+impl PartialEq for OrdFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for OrdFloat {}
+impl PartialOrd for OrdFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+impl Ord for OrdFloat {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
     }
 }

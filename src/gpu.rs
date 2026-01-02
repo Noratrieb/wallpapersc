@@ -1,6 +1,7 @@
-use std::ptr::NonNull;
+use std::{mem::offset_of, ptr::NonNull};
 
 use eyre::{Context, Result};
+use palette::Oklab;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -9,27 +10,42 @@ use wgpu::util::DeviceExt;
 
 pub struct AppGpuState {
     instance: wgpu::Instance,
-    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     render_pipeline: wgpu::RenderPipeline,
     screen_size_bind_group_layout: wgpu::BindGroupLayout,
+    desktop_colors_bind_group: wgpu::BindGroup,
 }
 
 pub struct SurfaceGpuState {
     surface: wgpu::Surface<'static>,
-    screen_size_buffer: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    input_buffer: wgpu::Buffer,
     screen_size_bind_group: wgpu::BindGroup,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct ScreenSizeUniform {
+struct InputUniform {
     size: [f32; 2], // width, height
+    voronoi_progress: f32,
+    _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct DesktopColorsStorage {
+    l: f32,
+    a: f32,
+    b: f32,
+    _pad: f32,
 }
 
 impl AppGpuState {
-    pub fn new() -> Result<Self> {
+    pub fn new(
+        desktop_colors: impl IntoIterator<Item = Oklab> + ExactSizeIterator,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
         let adapter =
@@ -54,10 +70,28 @@ impl AppGpuState {
                     count: None,
                 }],
             });
+        let desktop_colors_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("desktop_colors_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&screen_size_bind_group_layout],
+                bind_group_layouts: &[
+                    &screen_size_bind_group_layout,
+                    &desktop_colors_bind_group_layout,
+                ],
                 immediate_size: 0,
             });
 
@@ -73,11 +107,7 @@ impl AppGpuState {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[Some(wgpu::TextureFormat::Bgra8UnormSrgb.into())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -99,13 +129,42 @@ impl AppGpuState {
             cache: None,
         });
 
+        let desktop_colors = desktop_colors
+            .into_iter()
+            .map(|color| DesktopColorsStorage {
+                l: color.l,
+                a: color.a,
+                b: color.b,
+                _pad: 0.0,
+            })
+            .collect::<Vec<_>>();
+
+        let desktop_colors_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("desktop_colors_buffer"),
+            contents: bytemuck::cast_slice::<DesktopColorsStorage, u8>(&desktop_colors),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let desktop_colors_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &desktop_colors_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &desktop_colors_buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+            label: Some("desktop_colors_bind_group"),
+        });
+
         Ok(Self {
             instance,
-            adapter,
             device,
             queue,
             render_pipeline,
             screen_size_bind_group_layout,
+            desktop_colors_bind_group,
         })
     }
 }
@@ -135,7 +194,11 @@ impl SurfaceGpuState {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Screen Size Uniform Buffer"),
-                    contents: bytemuck::bytes_of(&ScreenSizeUniform { size: [0.0, 0.0] }),
+                    contents: bytemuck::bytes_of(&InputUniform {
+                        size: [0.0, 0.0],
+                        voronoi_progress: 0.0,
+                        _pad: 0.0,
+                    }),
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 });
 
@@ -157,38 +220,63 @@ impl SurfaceGpuState {
 
         Ok(Self {
             surface,
-            screen_size_buffer,
+            input_buffer: screen_size_buffer,
             screen_size_bind_group,
+            width: 0,
+            height: 0,
         })
     }
 
-    pub fn resize(&self, gpu_state: &AppGpuState, width: u32, height: u32) {
+    pub fn resize(&mut self, gpu_state: &AppGpuState, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+
         gpu_state.queue.write_buffer(
-            &self.screen_size_buffer,
+            &self.input_buffer,
             0,
-            bytemuck::bytes_of(&ScreenSizeUniform {
+            bytemuck::bytes_of(&InputUniform {
                 size: [width as f32, height as f32],
+                voronoi_progress: 0.0,
+                _pad: 0.0,
             }),
         );
 
-        let cap = self.surface.get_capabilities(&gpu_state.adapter);
+        self.configure(gpu_state);
+    }
+
+    fn configure(&self, gpu_state: &AppGpuState) {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: cap.formats[0],
-            view_formats: vec![cap.formats[0]],
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            view_formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width,
-            height,
+            width: self.width,
+            height: self.height,
             desired_maximum_frame_latency: 2,
             // Wayland is inherently a mailbox system.
             present_mode: wgpu::PresentMode::Mailbox,
         };
         self.surface.configure(&gpu_state.device, &surface_config);
+    }
 
-        let surface_texture = self
-            .surface
-            .get_current_texture()
-            .expect("failed to acquire next swapchain texture");
+    pub fn set_voronoi_progress(&self, gpu_state: &AppGpuState, voronoi_progress: f32) {
+        gpu_state.queue.write_buffer(
+            &self.input_buffer,
+            offset_of!(InputUniform, voronoi_progress) as u64,
+            bytemuck::bytes_of(&voronoi_progress),
+        );
+    }
+
+    pub fn draw(&self, gpu_state: &AppGpuState) {
+        let surface_texture = match self.surface.get_current_texture() {
+            Ok(texture) => texture,
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.configure(gpu_state);
+                self.surface.get_current_texture().unwrap()
+            }
+            Err(e) => panic!("failed to acquire next swapchain texture: {e}"),
+        };
+
         let texture_view: wgpu::TextureView = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -219,7 +307,8 @@ impl SurfaceGpuState {
             });
 
             render_pass.set_pipeline(&gpu_state.render_pipeline);
-            render_pass.set_bind_group(0, Some(&self.screen_size_bind_group), &[]);
+            render_pass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+            render_pass.set_bind_group(1, &gpu_state.desktop_colors_bind_group, &[]);
             render_pass.draw(0..6, 0..1);
         }
 
